@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ObliWAN Bench Tool — Windows MSI installer.
+
+  Prerequisites (one-time, on the build host):
+    dotnet tool install -g wix
+
+  Build by hand, from server/ (the release script does the same in a staging
+  directory, verifies both signatures, and only then publishes into
+  dist-bench — see build.mjs):
+    node src/bench/build.mjs                                 -> dist-bench/obliwan-bench.exe
+    powershell -ExecutionPolicy Bypass -Command "& '<signing script>' -Targets 'dist-bench\obliwan-bench.exe'"
+    wix build dist-bench/product.wxs -b dist-bench -arch x64 -out dist-bench/obliwan-bench.msi
+    powershell -ExecutionPolicy Bypass -Command "& '<signing script>' -Targets 'dist-bench\obliwan-bench.msi'"
+  Doing it by hand REPLACES what dist-bench publishes: build.mjs run
+  without its out option empties it first (the option is not spelled out
+  here: XML forbids a double hyphen inside a comment, and wix refuses the
+  whole file over one). From then until dist-bench is whole again (exe AND
+  MSI both validly signed, VERSION equal to src/bench/VERSION), or emptied
+  of all three on purpose, the release script refuses any server release
+  that does not rebuild the bench, and refuses before bumping anything. A
+  MISSING file is refused like an unsigned one: stopping after the exe
+  leaves a signed exe and no MSI, an image built from that serves no
+  installer, and every bench then stops being offered updates without
+  anything saying so.
+
+  It is dist-bench/product.wxs that wix builds, never this file: build.mjs
+  writes that copy with the version placeholder of Package/@Version
+  replaced, and the placeholder itself is not a version wix accepts.
+  build.mjs replaces the FIRST occurrence only, so the token must appear in
+  this file exactly once, on Package/@Version. Spelled out in a comment
+  above it, it is the comment that receives the version, wix refuses the
+  build (WIX0108), and every bench release aborts at its MSI step.
+
+  THE ORDER IS THE POINT: the exe is signed BEFORE the MSI is built, so the
+  binary embedded in the installer is itself signed; the MSI is then signed
+  separately. Same sequence as Obliview's `:BUILD_AGENT_WIN`.
+
+  ONE DELIBERATE DEVIATION FROM THE OTHER OBLI* PRODUCTS: there, a failed
+  signature is logged and the pipeline continues. Here it must ABORT. This
+  binary writes administrator accounts onto brand-new routers; an unsigned copy
+  reaching a preparation workstation is exactly what the signature exists to
+  prevent, and "Sign:ECHEC" in a summary nobody reads is not a control.
+
+  ┌─ WHAT THIS INSTALLER DELIBERATELY DOES NOT DO ─────────────────────────────┐
+  │ No service, no scheduled task, no autostart. The bench tool runs when a     │
+  │ preparer runs it and not one second longer: it is the only component of     │
+  │ ObliWAN allowed to write local accounts onto a device, and a thing with     │
+  │ that permission must not be resident.                                       │
+  │                                                                            │
+  │ It DOES store its one setting, and that reversed an earlier decision.       │
+  │ This comment used to say it stored nothing, on the reasoning that "a        │
+  │ preparation workstation is a shared machine". That is an assertion about    │
+  │ somebody's fleet, not a rule — and on this one it is false: the bench PC is │
+  │ a hardened, single-purpose, access-controlled machine. Designing against a  │
+  │ threat the deployment does not have bought nothing and cost a great deal:   │
+  │ it made a preparer open a command prompt and set environment variables      │
+  │ before every session, which is exactly the fiddling an installer exists to  │
+  │ remove — and a step skipped under pressure is a step that stops happening.  │
+  │                                                                            │
+  │ So OBLIWANURL is an installer property, written to obliwan-bench.ini        │
+  │ beside the executable, and remembered across upgrades (see the property    │
+  │ below). The preparer double-clicks a shortcut and answers questions about  │
+  │ the ROUTER, never about ObliWAN.                                            │
+  │                                                                            │
+  │ This comment once named an OBLIWANTOKEN property as well. None exists in   │
+  │ this file: the installer writes no credential, only a URL. The .ini sits   │
+  │ in Program Files and the remembered copy in HKLM — both readable by any    │
+  │ local account, writable only by an administrator — and what they disclose  │
+  │ is where the ObliWAN instance lives, which is not a secret.                │
+  └────────────────────────────────────────────────────────────────────────────┘
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="ObliWAN Bench Tool"
+           Manufacturer="ObliWAN"
+           Version="BENCH_VERSION_PLACEHOLDER"
+           Language="1033"
+           Scope="perMachine"
+           UpgradeCode="8F2E4A61-3B7C-4D0E-9A15-6C2D8E4F1B03">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the ObliWAN Bench Tool is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      The setting, supplied at the FIRST install:
+
+        msiexec /i obliwan-bench.msi OBLIWANURL=https://obliwan.example.com
+
+      `Secure="yes"` lets it survive an elevated install (without it, MSI
+      discards public properties passed from a non-elevated caller).
+
+      ┌─ REMEMBERED, BECAUSE EVERY UPGRADE IS AN UNINSTALL FIRST ────────────┐
+      │ Windows Installer keeps no public property from one install to the   │
+      │ next, and MajorUpgrade removes the old product                       │
+      │ (afterInstallValidate) before writing the new one — which deletes    │
+      │ the old `url=` line. So an upgrade started with no OBLIWANURL (the   │
+      │ tool's self-update, before it passed one; or a preparer              │
+      │ double-clicking the MSI from "Download app") used to write `url=`    │
+      │ EMPTY: every bench forgot its server on every update, and            │
+      │ config.ts's "the MSI writes it ONCE, at install" held exactly once.  │
+      │                                                                      │
+      │ The fix is the standard remember-property pattern:                   │
+      │   - BenchConfig also writes the value to HKLM\Software\ObliWAN\Bench │
+      │     (`url`);                                                         │
+      │   - AppSearch reads it back — it runs before RemoveExistingProducts, │
+      │     so the OLD product's value is still there to read;               │
+      │   - but AppSearch OVERWRITES a property given on the command line,   │
+      │     so the command-line value is saved before AppSearch and put back │
+      │     after it. A technician re-pointing a bench with                  │
+      │     `OBLIWANURL=<new>` therefore wins over the remembered one.       │
+      │ Both SetProperty actions run in BOTH sequences on purpose: AppSearch │
+      │ runs in each, and in the execute sequence the "saved" value is the   │
+      │ one the UI sequence settled on, so a second AppSearch cannot undo    │
+      │ it either.                                                           │
+      │                                                                      │
+      │ Upgrading FROM a version without this registry value has nothing to  │
+      │ read back, so it keeps the URL only if the upgrade passes OBLIWANURL │
+      │ itself. The bench's self-update does, from the .ini it read          │
+      │ (selfUpdate.ts, msiexecArguments); a double-click on the new MSI     │
+      │ does not, and loses the URL that one time. (IniFileSearch cannot     │
+      │ help — Windows Installer only looks for .ini files in the Windows    │
+      │ directory.)                                                          │
+      └──────────────────────────────────────────────────────────────────────┘
+    -->
+    <Property Id="OBLIWANURL" Secure="yes">
+      <RegistrySearch Id="RememberedObliwanUrl"
+                      Root="HKLM"
+                      Key="Software\ObliWAN\Bench"
+                      Name="url"
+                      Type="raw" />
+    </Property>
+    <SetProperty Id="CMDLINE_OBLIWANURL"
+                 Action="SaveCmdlineObliwanUrl"
+                 Value="[OBLIWANURL]"
+                 Before="AppSearch" />
+    <SetProperty Id="OBLIWANURL"
+                 Action="RestoreCmdlineObliwanUrl"
+                 Value="[CMDLINE_OBLIWANURL]"
+                 After="AppSearch"
+                 Condition="CMDLINE_OBLIWANURL" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ObliWAN Bench">
+        <Component Id="BenchExe" Guid="1D6B9C34-7E20-4A8F-B5C1-92E07A3D4F68">
+          <File Id="ObliwanBenchExe"
+                Source="obliwan-bench.exe"
+                Name="obliwan-bench.exe"
+                KeyPath="yes" />
+        </Component>
+
+        <!--
+          Written beside the executable, removed with it. `IniFile` rather than
+          a registry key so the tool can read it with `fs.readFileSync` and no
+          native module: this binary is a Node SEA, and adding a registry
+          dependency to reach one string would be a build problem in exchange
+          for nothing. The registry copy below is for the INSTALLER, which
+          cannot read an .ini outside the Windows directory; the tool never
+          reads it.
+
+          A FIRST install with no OBLIWANURL writes an empty value, and the
+          tool treats empty as absent and asks. An UPGRADE with no OBLIWANURL
+          writes back the remembered one (see the property above).
+        -->
+        <Component Id="BenchConfig" Guid="7A4F1E92-0C86-4B3D-A71F-5E2D0B94C863">
+          <IniFile Id="BenchUrl"
+                   Action="addLine"
+                   Directory="INSTALLFOLDER"
+                   Name="obliwan-bench.ini"
+                   Section="server"
+                   Key="url"
+                   Value="[OBLIWANURL]" />
+          <!-- What RememberedObliwanUrl reads back on the next upgrade. -->
+          <RegistryValue Root="HKLM"
+                         Key="Software\ObliWAN\Bench"
+                         Name="url"
+                         Type="string"
+                         Value="[OBLIWANURL]" />
+          <RegistryValue Root="HKLM"
+                         Key="Software\ObliWAN\Bench"
+                         Name="configured"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      A Start-menu entry only. No Run key, no service: see the box above.
+      The target is the application itself: build.mjs marks obliwan-bench.exe
+      as a Windows GUI-subsystem program, so the shortcut opens the
+      application window (Edge in app mode) and no console. No argument is
+      passed: the console mode (the cli switch) no longer exists.
+    -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="ObliWAN">
+        <Component Id="BenchShortcut" Guid="4C81E7A2-95D3-46B8-8F70-B3A6D1902E5C">
+          <Shortcut Id="BenchStartMenu"
+                    Name="ObliWAN Bench Tool"
+                    Description="Prepare a new router for ObliWAN"
+                    Target="[INSTALLFOLDER]obliwan-bench.exe"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
+          <RegistryValue Root="HKCU"
+                         Key="Software\ObliWAN\Bench"
+                         Name="installed"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="ObliWAN Bench Tool" Level="1">
+      <ComponentRef Id="BenchExe" />
+      <ComponentRef Id="BenchShortcut" />
+      <!-- Every Component needs a parent Feature or WiX refuses the build with
+           WIX0267. Adding the Component without this line is exactly how a
+           settings file silently stops being installed. -->
+      <ComponentRef Id="BenchConfig" />
+    </Feature>
+  </Package>
+</Wix>

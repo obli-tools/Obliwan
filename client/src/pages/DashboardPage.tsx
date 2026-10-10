@@ -1,0 +1,233 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import { Router, MapPin, GitCompareArrows, PlayCircle, SignalLow, Smartphone } from 'lucide-react';
+import { CAPABILITIES, type ApiResponse, type SimFleetSummary } from '@obliwan/shared';
+import apiClient from '@/api/client';
+import { Backup4gFleetPanel, type Backup4gFleetItem } from '@/components/telemetry/Backup4gFleetPanel';
+import { systemApi, type SystemInfo } from '@/api/system.api';
+import { devicesApi } from '@/api/devices.api';
+import { sitesApi } from '@/api/sites.api';
+import { simApi } from '@/api/sim.api';
+import { useAuthStore } from '@/store/authStore';
+import { GodViewMarker } from '@/components/common/TenantBadge';
+import { NoTeamBanner } from '@/components/common/NoTeamBanner';
+import { GodViewTenantFilter } from '@/components/common/GodViewTenantFilter';
+
+/**
+ * The fleet dashboard.
+ *
+ * ┌─ WHAT THIS PAGE USED TO BE, AND WHY IT CHANGED ──────────────────────────┐
+ * │ It was the first shell: four tiles reading "—", each stamped with the     │
+ * │ milestone that would fill it, over a banner explaining that fleet         │
+ * │ features were greyed out. That was honest then and became a lie the day   │
+ * │ the inventory landed — and it stayed on the first screen an operator      │
+ * │ sees, telling them the product did not exist yet.                         │
+ * │                                                                          │
+ * │ Placeholder copy has no expiry date. This page now counts what is really  │
+ * │ there, and when there is nothing it says so as a fact about THE FLEET,    │
+ * │ never as a fact about the software.                                       │
+ * └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * Counts come from the list endpoints rather than a dedicated stats route: one
+ * fewer surface to keep consistent, and a tile that disagrees with the page it
+ * links to is worse than a tile that loads a little slower. `null` means the
+ * call failed and the tile shows "—" — an unreachable API must never render as
+ * a fleet of zero.
+ */
+
+interface TileProps {
+  label: string;
+  icon: React.ReactNode;
+  value: number | null;
+  to: string;
+  /** Shown under the number: "3 pending", "2 down". Never invented. */
+  detail?: string | null;
+}
+
+function StatCard({ label, icon, value, to, detail }: TileProps) {
+  return (
+    <Link
+      to={to}
+      className="block rounded-lg border border-border bg-bg-secondary p-4 transition-colors hover:border-text-muted"
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-text-muted">{icon}</span>
+        <span className="text-sm text-text-secondary">{label}</span>
+      </div>
+      <div className={`text-2xl font-bold ${value === null ? 'text-text-muted' : 'text-text-primary'}`}>
+        {value === null ? '—' : value}
+      </div>
+      <div className="mt-1 h-4 text-[11px] text-text-muted">{detail ?? ''}</div>
+    </Link>
+  );
+}
+
+export function DashboardPage() {
+  const { t } = useTranslation();
+  const hasCapability = useAuthStore((store) => store.hasCapability);
+  const canReadSim = hasCapability(CAPABILITIES.SIM_READ);
+  // Same gate as the Changes menu entry: a tile must not lead where the menu does not (#21).
+  const canSeeChanges = useAuthStore((store) => store.isAdmin()) || hasCapability(CAPABILITIES.CHANGE_APPLY);
+  const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
+  const [devices, setDevices] = useState<{ total: number; pending: number; quarantined: number } | null>(null);
+  const [sites, setSites] = useState<number | null>(null);
+  const [sim, setSim] = useState<SimFleetSummary | null>(null);
+  // Sites on 4G backup. null = not loaded yet or failed (`backupFailed`): an
+  // unreachable API must never render as "no site on backup".
+  const [backup, setBackup] = useState<Backup4gFleetItem[] | null>(null);
+  const [backupFailed, setBackupFailed] = useState(false);
+  // Bumped by the god view's workspace filter: the tiles re-count.
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    systemApi.getInfo().then(setSystemInfo).catch(() => setSystemInfo(null));
+
+    devicesApi
+      .list({})
+      .then((list) =>
+        setDevices({
+          total: list.length,
+          pending: list.filter((d) => d.status === 'pending').length,
+          quarantined: list.filter((d) => d.status === 'quarantined').length,
+        }),
+      )
+      .catch(() => setDevices(null));
+
+    sitesApi.list({}).then((l) => setSites(l.length)).catch(() => setSites(null));
+
+    apiClient
+      .get<ApiResponse<Backup4gFleetItem[]>>('/devices/backup-4g')
+      .then((r) => { setBackup(r.data.data ?? []); setBackupFailed(false); })
+      .catch(() => { setBackup(null); setBackupFailed(true); });
+
+    // Swallowed on failure like every other tile here: an unreachable API must
+    // render as "—", never as a fleet of zero.
+    if (canReadSim) simApi.summary().then(setSim).catch(() => setSim(null));
+  }, [canReadSim, reload]);
+
+  // Quarantine before pending: a device that FAILED an identity assertion
+  // is a different kind of urgent from one merely waiting to be placed.
+  const deviceDetail = devices === null
+    ? null
+    : devices.quarantined > 0
+      ? t('dashboard.quarantined', { count: devices.quarantined, defaultValue: '{{count}} quarantined' })
+      : devices.pending > 0
+        ? t('dashboard.pending', { count: devices.pending, defaultValue: '{{count}} awaiting binding' })
+        : null;
+
+  const fleetIsEmpty = devices !== null && devices.total === 0;
+
+  /**
+   * The 4G tile.
+   *
+   * Shown only to a session holding SIM_READ, and only once the fleet actually
+   * has a SIM line — an MSP with no mobile lines should not carry a permanent
+   * "0" for a subsystem it does not use. `lowLines + unknownLines` is the
+   * number worth putting on the first screen: a line nobody can read is not a
+   * healthy line, and folding the two together here would be the same lie the
+   * mobile dashboard refuses to tell.
+   */
+  const simAttention =
+    sim === null ? null : sim.lowLines + sim.unknownLines;
+
+  return (
+    <div className="p-6">
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="flex items-center gap-2 text-2xl font-semibold text-text-primary">
+          {t('dashboard.title', { defaultValue: 'Dashboard' })}
+          {/* God view: every tile below counts every workspace (or the one picked). */}
+          <GodViewMarker />
+          <GodViewTenantFilter onChange={() => setReload((n) => n + 1)} className="ml-2 text-sm font-normal" />
+        </h1>
+        {systemInfo && (
+          <span className="font-mono text-xs text-text-muted">
+            ObliWAN v{systemInfo.appVersion}
+          </span>
+        )}
+      </div>
+
+      <NoTeamBanner />
+
+      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard
+          label={t('dashboard.devices', { defaultValue: 'Devices' })}
+          icon={<Router size={16} />}
+          value={devices?.total ?? null}
+          detail={deviceDetail}
+          to="/devices"
+        />
+        <StatCard
+          label={t('dashboard.sites', { defaultValue: 'Sites' })}
+          icon={<MapPin size={16} />}
+          value={sites}
+          to="/sites"
+        />
+        <StatCard
+          label={t('dashboard.drift', { defaultValue: 'Drift' })}
+          icon={<GitCompareArrows size={16} />}
+          value={null}
+          detail={t('dashboard.openRuns', { defaultValue: 'see detail' })}
+          to="/drift"
+        />
+        {canSeeChanges && (
+          <StatCard
+            label={t('dashboard.changes', { defaultValue: 'Changes' })}
+            icon={<PlayCircle size={16} />}
+            value={null}
+            detail={t('dashboard.openRuns', { defaultValue: 'see detail' })}
+            to="/changes"
+          />
+        )}
+        {/* 4G. Hidden entirely when the fleet has no SIM line: a permanent zero
+            for a subsystem nobody uses is noise on the first screen an operator
+            sees. */}
+        {canReadSim && sim !== null && sim.totalLines > 0 ? (
+          <StatCard
+            label={t('dashboard.mobile', { defaultValue: 'Mobile data' })}
+            icon={<SignalLow size={16} />}
+            value={simAttention}
+            detail={t('dashboard.mobileDetail', {
+              low: sim.lowLines,
+              unknown: sim.unknownLines,
+              defaultValue: '{{low}} low, {{unknown}} unreadable',
+            })}
+            to="/mobile"
+          />
+        ) : null}
+        {!fleetIsEmpty && (
+          <StatCard
+            label={t('dashboard.backup4g.title')}
+            icon={<Smartphone size={16} />}
+            value={backup === null ? null : backup.length}
+            detail={backup === null
+              ? null
+              : t('dashboard.backup4g.detail', { alerted: backup.filter((b) => b.alertedAt !== null).length })}
+            to="/devices"
+          />
+        )}
+      </div>
+
+      {!fleetIsEmpty && devices !== null && <Backup4gFleetPanel items={backup} failed={backupFailed} />}
+
+      {fleetIsEmpty && (
+        <div className="rounded-lg border border-border bg-bg-secondary">
+          <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-bg-tertiary">
+              <Router size={26} className="text-text-muted" />
+            </div>
+            <h2 className="mb-2 text-base font-semibold text-text-primary">
+              {t('dashboard.emptyTitle', { defaultValue: 'No equipment yet' })}
+            </h2>
+            <p className="max-w-md text-sm text-text-secondary">
+              {t('dashboard.emptyBody', {
+                defaultValue:
+                  'Declare the concentrator and its PPP sessions will populate the quarantine, or enrol a directly reachable device by hand.',
+              })}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

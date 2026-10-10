@@ -1,0 +1,22 @@
+node_modules
+**/node_modules
+**/dist
+# ...mais PAS dist-bench : l image serveur embarque l installeur d etabli pour
+# le servir depuis /api/bench/download. `**/dist` ne matche qu un segment
+# nomme exactement "dist", donc cette exception est une ceinture en plus des
+# bretelles — ecrite parce qu un futur `**/dist*` viderait l endpoint en silence.
+!server/dist-bench
+!server/dist-bench/**
+.git
+.env
+*.md
+.vscode
+.*
+custom
+
+# Real customer data: must not travel to the build host in the Docker context.
+TrainingDatas
+
+# Local test harnesses (gitignored **/testing/): never part of an image. They import
+# dev-only packages (socket.io-client…) the image does not install, so tsc failed.
+**/testing

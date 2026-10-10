@@ -1,0 +1,270 @@
+# ObliWAN — build-from-source stack (same topology as docker-compose.yml).
+#
+#   docker compose -f docker-compose.build.yml up -d --build
+#
+# Read the header of docker-compose.yml first: it documents the host route to
+# the L2TP tunnel subnet, why `server` is the one service in the Obli* suite
+# that publishes ports, and what persists across an update (PERSISTENT DATA:
+# the change-backup volume and the opt-in `db-backup` service, both below).
+# It also documents the opt-in WireGuard link to the CHR ("OR LET OBLIWAN BUILD
+# THAT ROUTE"): the `obliwan-wg` service below, created only with the `wg`
+# profile (COMPOSE_PROFILES=wg) and inert unless OBLIWAN_WG_ENABLED=true.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: obliwan
+      POSTGRES_USER: obliwan
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obliwan"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgres://obliwan:${DB_PASSWORD:-changeme}@postgres:5432/obliwan
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-in-production}
+      OBLIWAN_ENCRYPTION_KEY: ${OBLIWAN_ENCRYPTION_KEY:-}
+      OBLIWAN_ROLE: ${OBLIWAN_ROLE:-all}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:3004}
+      # Optional override: the public URL for links that LEAVE the server.
+      # Unset is normal — CLIENT_ORIGIN above is the fallback. See .env.example.
+      APP_URL: ${APP_URL:-}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      CWMP_PORT: ${CWMP_PORT:-7547}
+      SNMP_TRAP_PORT: ${SNMP_TRAP_PORT:-162}
+      SYSLOG_PORT: ${SYSLOG_PORT:-514}
+      BENCH_ARTEFACT_DIR: ${BENCH_ARTEFACT_DIR:-}
+      # Pre-change device backups. The SAME expression is the mount target of
+      # `change_backups` below — see "PERSISTENT DATA" in docker-compose.yml.
+      OBLIWAN_BACKUP_ROOT: ${OBLIWAN_BACKUP_ROOT:-/app/server/data/backups}
+      # The WireGuard link's shared directory — the mount target of `wg_link`
+      # below, and the SAME path in `obliwan-wg`.
+      OBLIWAN_WG_DIR: /app/server/data/wg
+    ports:
+      # Inbound device traffic — the documented exception to the suite topology.
+      - "${CWMP_PORT:-7547}:7547/tcp"
+      #- "${CWMP_TLS_PORT:-7548}:7548/tcp"
+      - "${SNMP_TRAP_PORT:-162}:162/udp"
+      - "${SYSLOG_PORT:-514}:514/udp"
+      - "${SYSLOG_PORT:-514}:514/tcp"
+    volumes:
+      # Persistent custom directory: scripts, SSH keys, etc.
+      # SSH keys: chmod 700 custom/.ssh && chmod 600 custom/.ssh/id_*
+      - ${CUSTOM_DIR:-./custom}:/custom
+      # Pre-change device backups. Without this they live in the
+      # container layer and vanish at every image rebuild.
+      - change_backups:${OBLIWAN_BACKUP_ROOT:-/app/server/data/backups}
+      # The WireGuard link (docker-compose.yml header): the server writes
+      # wg-obliwan.conf here, the obliwan-wg sidecar writes status.json.
+      - wg_link:/app/server/data/wg
+      # Bench tool installer. The server IMAGE carries it (server/Dockerfile
+      # copies dist-bench), so a default deployment serves it with nothing to
+      # configure. This used to bind-mount ./bench ONTO that directory — and a
+      # bind mount hides the image content beneath it, while Docker creates
+      # ./bench empty when it is missing: the baked-in installer was never
+      # served. To publish a newer installer WITHOUT rebuilding the server,
+      # uncomment the line below and set BENCH_ARTEFACT_DIR=/bench-override.
+      #- ${BENCH_DIR:-./bench}:/bench-override:ro
+
+  # The HOST half of the WireGuard link to the CHR — see "OR LET OBLIWAN BUILD
+  # THAT ROUTE" in docker-compose.yml. Built from the server Dockerfile (the
+  # same image as `server`, another entrypoint: dist/src/wgSidecar.js — no
+  # database, no HTTP). Created only with the `wg` profile; inert unless
+  # OBLIWAN_WG_ENABLED=true.
+  obliwan-wg:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    profiles: ["wg"]
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["node", "dist/src/wgSidecar.js"]
+    environment:
+      # Empty by default on purpose: unset = touch nothing (docker-compose.yml).
+      OBLIWAN_WG_ENABLED: ${OBLIWAN_WG_ENABLED:-}
+      OBLIWAN_WG_DIR: /app/server/data/wg
+    volumes:
+      - wg_link:/app/server/data/wg
+    healthcheck:
+      # The image's own healthcheck probes the API server, which does not run
+      # here. The sidecar rewrites status.json every 5 s: a fresh file is its
+      # heartbeat.
+      test: ["CMD-SHELL", "find /app/server/data/wg/status.json -mmin -1 | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${LISTEN_PORT:-3004}:80"
+
+  # OPT-IN nightly database dump — see "PERSISTENT DATA" in the header of
+  # docker-compose.yml. Started only with the profile:
+  #     COMPOSE_PROFILES=backup docker compose up -d
+  # Restoring, and TESTING a restore, are operator procedures, not compose.
+  #
+  # Each run writes, in this order, a custom-format dump (pg_dump -Fc) and a
+  # tar.gz of the `change_backups` volume (mounted read-only here). The order
+  # makes them a pair: a device backup file is moved into place BEFORE its
+  # `device_backups` row is inserted, so every row in a dump has its file in
+  # the archive taken right after it. One run per night at DB_BACKUP_TIME
+  # (HH:MM, UTC — the container clock), plus one at start unless
+  # DB_BACKUP_ON_START=0, so a broken setup shows in
+  # `docker compose logs db-backup` the day it is deployed rather than the
+  # night it is needed. Each file is written under a `.partial-*` name and
+  # renamed only once it has been read back (`pg_restore --list`, `tar -t`):
+  # a half-written file never wears a backup's name.
+  # Retention, per kind: delete files older than DB_BACKUP_KEEP_DAYS but
+  # always keep the newest DB_BACKUP_KEEP_MIN, and prune ONLY after a
+  # successful write — a month of failures must not age the last good
+  # backups away. Before each write, the free space on /dumps must cover the
+  # expected size (the previous file of that kind; for a first archive, the
+  # size of change_backups) plus DB_BACKUP_MIN_FREE_MB (default 1024): /dumps
+  # is by default on the database's own disk, and a backup that fills it
+  # takes PostgreSQL down with it. A write refused for space is logged as
+  # SKIPPED and prunes nothing.
+  # The healthcheck turns `unhealthy` when no dump, or no archive, is younger
+  # than 26 hours. That includes a first start with DB_BACKUP_ON_START=0, until
+  # the first nightly run: there is no backup yet, and that is what it says.
+  # Nothing in this file alerts on it: watch `docker compose ps`.
+  # `docker compose down -v` deletes every named volume, db_dumps and
+  # change_backups included: the backups go with what they protect.
+  #
+  # pg_dump refuses a server whose major version is newer than its own: keep
+  # DB_BACKUP_PG_TAG at or above the database's major (the `postgres`
+  # service here runs 16). The script below is identical in the four compose
+  # files (docker-compose.yml, .build, .host, .external-db): change one,
+  # change all four.
+  db-backup:
+    image: postgres:${DB_BACKUP_PG_TAG:-16-alpine}
+    profiles: ["backup"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://obliwan:${DB_PASSWORD:-changeme}@postgres:5432/obliwan
+      DB_BACKUP_TIME: ${DB_BACKUP_TIME:-01:30}
+      DB_BACKUP_KEEP_DAYS: ${DB_BACKUP_KEEP_DAYS:-14}
+      DB_BACKUP_KEEP_MIN: ${DB_BACKUP_KEEP_MIN:-7}
+      DB_BACKUP_ON_START: ${DB_BACKUP_ON_START:-1}
+      DB_BACKUP_MIN_FREE_MB: ${DB_BACKUP_MIN_FREE_MB:-1024}
+    volumes:
+      - ${DB_BACKUP_DIR:-db_dumps}:/dumps
+      - change_backups:/change_backups:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        log() { echo "[db-backup] $$(date -u +%Y-%m-%dT%H:%M:%SZ) $$*"; }
+        num() { case "$$2" in ''|*[!0-9]*) log "$$1 must be a whole number, got '$$2'"; exit 1;; esac; }
+        num DB_BACKUP_KEEP_DAYS "$$DB_BACKUP_KEEP_DAYS"
+        num DB_BACKUP_KEEP_MIN "$$DB_BACKUP_KEEP_MIN"
+        num DB_BACKUP_MIN_FREE_MB "$$DB_BACKUP_MIN_FREE_MB"
+        case "$$DB_BACKUP_TIME" in
+          [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+          *) log "DB_BACKUP_TIME must be HH:MM (UTC), got '$$DB_BACKUP_TIME'"; exit 1;;
+        esac
+        th=$${DB_BACKUP_TIME%%:*}; tm=$${DB_BACKUP_TIME##*:}
+        target=$$(( $${th#0} * 3600 + $${tm#0} * 60 ))
+        prune() {
+          ls -1 /dumps/"$$1"-*"$$2" 2>/dev/null | sort -r | tail -n +$$((DB_BACKUP_KEEP_MIN + 1)) |
+          while read -r f; do
+            if [ -n "$$(find "$$f" -mtime +"$$DB_BACKUP_KEEP_DAYS")" ]; then rm -f "$$f"; log "pruned $$f"; fi
+          done
+        }
+        keep() { mv "$$1" "$$2"; log "OK: $$2 ($$(du -h "$$2" | cut -f1))"; }
+        last_kb() {
+          f=$$(ls -1 /dumps/"$$1"-*"$$2" 2>/dev/null | sort -r | head -n 1)
+          if [ -n "$$f" ]; then du -k "$$f" | cut -f1; else echo 0; fi
+        }
+        room() {
+          case "$$1" in ''|*[!0-9]*) need=0;; *) need=$$1;; esac
+          avail=$$(df -Pk /dumps | awk 'NR == 2 { print $$4 }')
+          case "$$avail" in
+            ''|*[!0-9]*) log "$$2 SKIPPED: free space on /dumps unreadable"; return 1;;
+          esac
+          if [ "$$avail" -lt $$(( need + DB_BACKUP_MIN_FREE_MB * 1024 )) ]; then
+            log "$$2 SKIPPED: $$(( avail / 1024 )) MB free on /dumps, about $$(( need / 1024 )) MB needed plus DB_BACKUP_MIN_FREE_MB=$$DB_BACKUP_MIN_FREE_MB"
+            return 1
+          fi
+        }
+        backup_once() {
+          stamp=$$(date -u +%Y%m%d-%H%M%S)
+          part="/dumps/.partial-obliwan-$$stamp.dump"
+          if ! room "$$(last_kb obliwan .dump)" dump; then
+            log "dump not written: nothing pruned, older dumps kept"
+          elif pg_dump --dbname="$$DATABASE_URL" --format=custom --file="$$part" &&
+             pg_restore --list "$$part" >/dev/null; then
+            keep "$$part" "/dumps/obliwan-$$stamp.dump"; prune obliwan .dump
+          else
+            rm -f "$$part"; log "dump FAILED: nothing pruned, older dumps kept"
+          fi
+          part="/dumps/.partial-change_backups-$$stamp.tgz"
+          est=$$(last_kb change_backups .tgz)
+          if [ "$$est" = 0 ]; then est=$$(du -sk /change_backups | cut -f1); fi
+          if ! room "$$est" "change_backups archive"; then
+            log "change_backups archive not written: nothing pruned, older archives kept"
+          elif tar -czf "$$part" -C /change_backups . && tar -tzf "$$part" >/dev/null; then
+            keep "$$part" "/dumps/change_backups-$$stamp.tgz"; prune change_backups .tgz
+          else
+            rm -f "$$part"; log "change_backups archive FAILED: nothing pruned, older archives kept"
+          fi
+        }
+        trap 'exit 0' TERM INT
+        rm -f /dumps/.partial-*
+        log "nightly at $$DB_BACKUP_TIME UTC; keep the newest $$DB_BACKUP_KEEP_MIN of each kind, prune older than $$DB_BACKUP_KEEP_DAYS days; keep $$DB_BACKUP_MIN_FREE_MB MB free on /dumps"
+        if [ "$$DB_BACKUP_ON_START" = "1" ]; then backup_once; fi
+        while :; do
+          h=$$(date -u +%H); m=$$(date -u +%M); s=$$(date -u +%S)
+          now=$$(( $${h#0} * 3600 + $${m#0} * 60 + $${s#0} ))
+          wait_s=$$(( (target - now + 86400) % 86400 ))
+          if [ "$$wait_s" -eq 0 ]; then wait_s=86400; fi
+          log "next run in $$wait_s s"
+          sleep "$$wait_s" & wait $$!
+          backup_once
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "find /dumps -maxdepth 1 -name 'obliwan-*.dump' -mmin -1560 | grep -q . && find /dumps -maxdepth 1 -name 'change_backups-*.tgz' -mmin -1560 | grep -q ."]
+      interval: 10m
+      timeout: 30s
+      retries: 1
+      start_period: 15m
+
+volumes:
+  postgres_data:
+  change_backups:
+  db_dumps:
+  # The WireGuard link's shared directory (server <-> obliwan-wg). Holds the
+  # host's private key (0600) — derived state: a "connect" re-run rewrites it
+  # from the vault, so it needs no backup.
+  wg_link:

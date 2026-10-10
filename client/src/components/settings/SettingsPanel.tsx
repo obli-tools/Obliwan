@@ -1,0 +1,112 @@
+import { useState, useEffect } from 'react';
+import type { ResolvedSettings, SettingsScope } from '@obliwan/shared';
+import type { SettingsKey } from '@obliwan/shared';
+import { SETTINGS_DEFINITIONS } from '@obliwan/shared';
+import { settingsApi } from '@/api/settings.api';
+import { SettingField } from './SettingField';
+import { SnmpCredentialsCard } from './SnmpCredentialsCard';
+import { LoadingSpinner } from '@/components/common/LoadingSpinner';
+import toast from 'react-hot-toast';
+
+interface SettingsPanelProps {
+  scope: SettingsScope;
+  scopeId: number | null;
+  title?: string;
+}
+
+export function SettingsPanel({ scope, scopeId, title }: SettingsPanelProps) {
+  const [resolved, setResolved] = useState<ResolvedSettings | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, number>>({});
+  const [loading, setLoading] = useState(true);
+
+  const fetchSettings = async () => {
+    setLoading(true);
+    try {
+      let data;
+      if (scope === 'global') {
+        data = await settingsApi.getGlobalResolved();
+      } else if (scope === 'group') {
+        data = await settingsApi.getGroupResolved(scopeId!);
+      } else {
+        data = await settingsApi.getMonitorResolved(scopeId!);
+      }
+      setResolved(data.resolved);
+      setOverrides(data.overrides);
+    } catch {
+      toast.error('Failed to load settings');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSettings();
+  }, [scope, scopeId]);
+
+  const handleSave = async (key: SettingsKey, value: number) => {
+    const scopeIdStr = scopeId !== null ? String(scopeId) : 'null';
+    try {
+      await settingsApi.set(scope, scopeIdStr, key, value);
+      toast.success('Setting saved');
+      await fetchSettings();
+    } catch {
+      toast.error('Failed to save setting');
+    }
+  };
+
+  const handleReset = async (key: SettingsKey) => {
+    const scopeIdStr = scopeId !== null ? String(scopeId) : 'null';
+    try {
+      await settingsApi.remove(scope, scopeIdStr, key);
+      toast.success('Reset to inherited');
+      await fetchSettings();
+    } catch {
+      toast.error('Failed to reset setting');
+    }
+  };
+
+  if (loading || !resolved) {
+    return (
+      <div className="flex justify-center py-8">
+        <LoadingSpinner />
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-bg-secondary p-5">
+      {title && (
+        <h2 className="text-xs font-semibold text-text-muted uppercase tracking-wide mb-4">
+          {title}
+        </h2>
+      )}
+      <div>
+        {/* A workspace-only key is read at the global scope alone: offered in
+            a group's or a device's panel, its override would show as in force
+            and never be read (the server refuses that write too). */}
+        {SETTINGS_DEFINITIONS.filter((def) => scope === 'global' || !def.workspaceOnly).map((def) => (
+          <SettingField
+            key={def.key}
+            definition={def}
+            inheritedValue={resolved[def.key]}
+            overrideValue={overrides[def.key]}
+            scope={scope}
+            onSave={handleSave}
+            onReset={handleReset}
+          />
+        ))}
+      </div>
+
+      {/* ── The credentials the setting above chooses from ──────────────────
+          Placed here, immediately under the settings, and only at global
+          scope: an SNMP credential is tenant-wide, so offering to create one
+          from inside a group's override panel would suggest it belongs to that
+          group. The SETTING is inheritable per group; the credential is not. */}
+      {scope === 'global' && (
+        <div className="mt-5">
+          <SnmpCredentialsCard />
+        </div>
+      )}
+    </div>
+  );
+}

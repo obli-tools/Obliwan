@@ -1,0 +1,174 @@
+import { Router } from 'express';
+import { CAPABILITIES } from '@obliwan/shared';
+import { snmpController } from '../controllers/snmp.controller';
+import { requireCapability } from '../middleware/rbac';
+import { godViewFromParam, godViewParam } from '../utils/globalView';
+
+/**
+ * SNMP / telemetry. Mounted under the tenant-scoped router, so `requireAuth`
+ * and `requireTenant` have already run.
+ *
+ * ┌─ THREE CAPABILITIES, AND THE SPLIT IS THE POINT ──────────────────────────┐
+ * │ SNMP_READ          see interfaces, series, thresholds and alert state.    │
+ * │ SNMP_ADMIN         change what is polled and what alerts (targets,        │
+ * │                    thresholds).                                          │
+ * │ CREDENTIAL_MANAGE  touch `snmp_credentials` AT ALL -- including the       │
+ * │                    listing.                                               │
+ * │                                                                          │
+ * │ Why the credential LIST is behind CREDENTIAL_MANAGE and not SNMP_READ,    │
+ * │ even though it returns no secret: the list is a map of which sites share  │
+ * │ which credential and which are still on v2c. That is reconnaissance, and  │
+ * │ an operator who may look at bandwidth graphs has no reason to hold it.    │
+ * │                                                                          │
+ * │ And why the graph routes are SNMP_READ and not DEVICE_READ: seeing that a │
+ * │ device exists in the inventory is a different question from seeing what   │
+ * │ it carries. The same reasoning as CONFIG_READ against DEVICE_READ in      │
+ * │ `devices.routes.ts`.                                                     │
+ * └──────────────────────────────────────────────────────────────────────────┘
+ */
+const router = Router();
+
+// God view (utils/globalView.ts): a route naming ONE snmp_interfaces row by `:ifId`
+// acts in that row's own tenant — read, write and audit alike. No-op for
+// anyone but a platform admin positioned on the master tenant.
+router.param('ifId', godViewParam('snmp_interfaces'));
+
+// God view (utils/globalView.ts): a route naming ONE devices row by `:deviceId`
+// acts in that row's own tenant — read, write and audit alike. No-op for
+// anyone but a platform admin positioned on the master tenant.
+router.param('deviceId', godViewParam('devices'));
+
+// -- Credentials: CREDENTIAL_MANAGE throughout, listing included -------------
+router.get(
+  '/credentials',
+  requireCapability(CAPABILITIES.CREDENTIAL_MANAGE),
+  snmpController.listCredentials,
+);
+// God view: ONE credential named by `:id` is read, changed and deleted in its
+// own tenant (audit there). Route-level, not router.param: `/thresholds/:id`
+// names another table under the same param name.
+router.get(
+  '/credentials/:id',
+  requireCapability(CAPABILITIES.CREDENTIAL_MANAGE),
+  godViewFromParam('snmp_credentials'),
+  snmpController.getCredential,
+);
+router.post(
+  '/credentials',
+  requireCapability(CAPABILITIES.CREDENTIAL_MANAGE),
+  snmpController.createCredential,
+);
+router.put(
+  '/credentials/:id',
+  requireCapability(CAPABILITIES.CREDENTIAL_MANAGE),
+  godViewFromParam('snmp_credentials'),
+  snmpController.updateCredential,
+);
+router.delete(
+  '/credentials/:id',
+  requireCapability(CAPABILITIES.CREDENTIAL_MANAGE),
+  godViewFromParam('snmp_credentials'),
+  snmpController.deleteCredential,
+);
+
+// -- Targets: reading is SNMP_READ, changing what we poll is SNMP_ADMIN ------
+router.get(
+  '/devices/:deviceId/target',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.getTarget,
+);
+router.put(
+  '/devices/:deviceId/target',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.putTarget,
+);
+router.delete(
+  '/devices/:deviceId/target',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.deleteTarget,
+);
+
+/**
+ * Discovery — reading its history is SNMP_READ, running one is SNMP_ADMIN.
+ *
+ * Forcing a walk is not a read: it puts packets on a customer's equipment and
+ * it RECONCILES — an interface that has genuinely disappeared is marked
+ * vanished, which retires its series. That is a change to what the fleet
+ * believes, so it sits with the other gestures that change what is polled.
+ */
+router.get(
+  '/devices/:deviceId/discovery',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.discoveryHistory,
+);
+router.post(
+  '/devices/:deviceId/discover',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.forceDiscovery,
+);
+
+// -- Interfaces and series --------------------------------------------------
+router.get(
+  '/devices/:deviceId/interfaces',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.listInterfaces,
+);
+router.get(
+  '/devices/:deviceId/series',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.deviceSeries,
+);
+/** Fleet-wide interface list: every interface of the tenant with its last
+ *  measurement, device and site. Declared BEFORE `/interfaces/:ifId/...` so the
+ *  literal path is not swallowed by the parameterised one. */
+router.get(
+  '/interfaces',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.listFleetInterfaces,
+);
+
+/** The graph. `granularity` is optional and is CLAMPED to what retention can
+ *  actually serve -- see `series.service.chooseGranularity`. */
+router.get(
+  '/interfaces/:ifId/series',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.interfaceSeries,
+);
+/** 95th percentile of 5-minute averages: the carrier billing convention. */
+router.get(
+  '/interfaces/:ifId/billing-p95',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.billingP95,
+);
+
+// -- Thresholds -------------------------------------------------------------
+router.get('/thresholds', requireCapability(CAPABILITIES.SNMP_READ), snmpController.listThresholds);
+router.get(
+  '/thresholds/:id',
+  requireCapability(CAPABILITIES.SNMP_READ),
+  snmpController.getThreshold,
+);
+router.post(
+  '/thresholds',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.createThreshold,
+);
+router.put(
+  '/thresholds/:id',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.updateThreshold,
+);
+router.delete(
+  '/thresholds/:id',
+  requireCapability(CAPABILITIES.SNMP_ADMIN),
+  snmpController.deleteThreshold,
+);
+
+/** Current alert state (ok / pending / firing) across the tenant. */
+router.get('/alerts', requireCapability(CAPABILITIES.SNMP_READ), snmpController.listAlerts);
+
+/** Collection health. A missing series and a broken collector look identical
+ *  on a chart; this is what tells them apart. */
+router.get('/status', requireCapability(CAPABILITIES.SNMP_READ), snmpController.status);
+
+export default router;

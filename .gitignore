@@ -1,0 +1,196 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+Thumbs.db
+coverage/
+.vscode/
+.idea/
+*.tsbuildinfo
+
+# Release tooling kept out of the public repo: it hard-codes the internal build
+# host and local paths. The host is deliberately NOT named here: this file is
+# itself published, and a comment explaining what it hides must not publish it.
+*.bat
+start.ps1
+
+# Caches et données locales du poste
+.cache/
+
+# Local dev / planning notes and architecture drafts
+PLAN.md
+.draft/
+custom/
+
+# Audit reports and design studies: kept out of the public repository.
+docs/
+
+# Throwaway patch/probe scripts (hard-coded absolute
+# paths, no place in the product).
+/__*.cjs
+/.*.cjs
+
+# ── Hors build : jamais publié ──
+# Doc, notes, scripts d'outillage : restent sur le poste.
+/docs/
+/docs-*/
+*.md
+*.bat
+*.cmd
+*.ps1
+*.psm1
+.cache/
+
+# Sortie du build de l'outil d'établi (exe, MSI, bundle esbuild) : produite par
+# le pipeline de release, jamais versionnée. Les SOURCES de l'installeur
+# vivent dans `server/src/bench/installer/`, et `sea-config.json` porte les
+# chemins absolus de la machine qui l'a généré.
+/server/dist-bench/*
+# ...except the marker that keeps the directory itself present. The server
+# Dockerfile COPYs this directory, and Docker fails a COPY whose source does
+# not exist — so a clone that has never run the bench build must still have
+# the folder, or every server image build breaks.
+!/server/dist-bench/.gitkeep
+
+# Operator config templates and generators carrying REAL customer data (names,
+# domains, address plans). Read locally to derive allocation and template
+# rules; never versioned, never pushed. Anonymised fixtures live in the tests.
+/TrainingDatas/
+
+# tsx compile cache written to a literal "undefined" directory when a sandboxed
+# worker (renderWorker, clusterWorker) runs under tsx with no TEMP in its
+# deliberately empty environment. Harness-only; never in a compiled build.
+/server/undefined/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Le dépôt ne contient que de quoi BUILDER,
+# rien d'autre. Tout ce qui suit reste sur le poste et n'est jamais publié.
+# Toute exception se déclare en négation explicite, APRÈS ce bloc, avec sa raison.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Fichiers et dossiers cachés du poste (caches, sessions d'outils, éditeurs,
+# brouillons, vérifications locales) : tous ignorés, sauf ceux du build.
+.*
+!.gitignore
+!.gitattributes
+!.dockerignore
+!.env.example
+!.gitkeep
+/REPRISE*
+/HANDOFF*
+/NOTES*
+/TODO*
+/PLAN*
+*.jsonl
+
+# Documentation, notes, exports bureautiques (peuvent contenir des données client)
+docs/
+doc/
+docs-*/
+*.md
+!/README.md
+*.markdown
+*.txt
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.csv
+*.tsv
+*.har
+*.pcap
+*.pcapng
+
+# Scripts d'outillage du poste (build, release, déploiement, bench)
+*.bat
+*.cmd
+*.ps1
+*.psm1
+*.py
+__pycache__/
+
+# Journaux, sauvegardes, restes d'édition
+*.log
+/logs/
+*.bak
+*.orig
+*.rej
+*.pre-*
+*.swp
+*~
+*.tmp
+
+# Bases et dumps locaux
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+*.backup
+
+# Secrets, clés et certificats
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.csr
+*.jks
+*.keystore
+*.pfx
+*.p12
+*.p8
+*.ppk
+*.kdbx
+*.secret
+*.credentials
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.mobileprovision
+
+# Tests et données de test : restent sur le poste (non nécessaires au build)
+*.test.*
+*.spec.*
+*_test.go
+*.verify.ts
+*.selftest.ts
+__tests__/
+testdata/
+fixtures/
+golden/
+*.golden
+*.sample
+*.export
+**/testing/
+/server/test/
+/server/tests/
+/client/test/
+/client/tests/
+
+# Binaires et sorties de build (produits sur le poste, jamais versionnés)
+*.exe
+*.msi
+*.dll
+*.syso
+*.wixpdb
+*.wixobj
+*.dmg
+*.pkg
+*.zip
+*.7z
+*.tar.gz
+*.tgz
+
+# Données d'instance locales
+custom/
+
+# Marqueur requis par le COPY du Dockerfile serveur (voir plus haut).
+!/server/dist-bench/.gitkeep
